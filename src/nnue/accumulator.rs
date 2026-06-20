@@ -374,6 +374,52 @@ mod simd {
         }
     }
 
+    #[inline]
+    unsafe fn psqt_block(
+        bucket: &Align<[i16; PSQT_FEATURES * L1_SIZE]>,
+        feature: PsqtFeatureIndex,
+    ) -> &Align<[i16; L1_SIZE]> {
+        let offset = feature.index() * L1_SIZE;
+        unsafe { slice_to_aligned(bucket.get_unchecked(offset..offset + L1_SIZE)) }
+    }
+
+    #[inline]
+    unsafe fn vector_add_sub_tiled<const ADDS: usize, const SUBS: usize>(
+        input: &Align<[i16; L1_SIZE]>,
+        output: &mut Align<[i16; L1_SIZE]>,
+        adds: [&Align<[i16; L1_SIZE]>; ADDS],
+        subs: [&Align<[i16; L1_SIZE]>; SUBS],
+    ) {
+        const REGISTERS: usize = 16;
+        const UNROLL: usize = I16_CHUNK * REGISTERS;
+        unsafe {
+            let mut registers = [simd::zero_i16(); REGISTERS];
+            for i in 0..L1_SIZE / UNROLL {
+                let unroll_offset = i * UNROLL;
+                for (r_idx, reg) in registers.iter_mut().enumerate() {
+                    let src = input.as_ptr().add(unroll_offset + r_idx * I16_CHUNK);
+                    *reg = simd::load_i16(src);
+                }
+                for sub in &subs {
+                    for (r_idx, reg) in registers.iter_mut().enumerate() {
+                        let src = sub.as_ptr().add(unroll_offset + r_idx * I16_CHUNK);
+                        *reg = simd::sub_i16(*reg, simd::load_i16(src));
+                    }
+                }
+                for add in &adds {
+                    for (r_idx, reg) in registers.iter_mut().enumerate() {
+                        let src = add.as_ptr().add(unroll_offset + r_idx * I16_CHUNK);
+                        *reg = simd::add_i16(*reg, simd::load_i16(src));
+                    }
+                }
+                for (r_idx, reg) in registers.iter().enumerate() {
+                    let dst = output.as_mut_ptr().add(unroll_offset + r_idx * I16_CHUNK);
+                    simd::store_i16(dst, *reg);
+                }
+            }
+        }
+    }
+
     /// Move a PSQT feature from one square to another.
     pub fn vector_add_sub_psqt(
         input: &Align<[i16; L1_SIZE]>,
@@ -382,27 +428,13 @@ mod simd {
         add: PsqtFeatureIndex,
         sub: PsqtFeatureIndex,
     ) {
-        let offset_add = add.index() * L1_SIZE;
-        let offset_sub = sub.index() * L1_SIZE;
-        let s_block;
-        let a_block;
-        // SAFETY: offset_{add,sub} are multiples of LAYER_1_SIZE, and so are correctly-aligned.
-        // additionally, as they originate from FeatureIndex, the L1-SIZE slices are all in bounds,
-        // as FeatureIndex ranges in 0..704.
         unsafe {
-            s_block = slice_to_aligned(bucket.get_unchecked(offset_sub..offset_sub + L1_SIZE));
-            a_block = slice_to_aligned(bucket.get_unchecked(offset_add..offset_add + L1_SIZE));
-        }
-        for i in 0..L1_SIZE / I16_CHUNK {
-            // SAFETY: we never hold multiple mutable references, we never mutate immutable memory, etc.
-            unsafe {
-                let x = simd::load_i16(input.as_ptr().add(i * I16_CHUNK));
-                let w_sub = simd::load_i16(s_block.as_ptr().add(i * I16_CHUNK));
-                let w_add = simd::load_i16(a_block.as_ptr().add(i * I16_CHUNK));
-                let t = simd::sub_i16(x, w_sub);
-                let t = simd::add_i16(t, w_add);
-                simd::store_i16(output.as_mut_ptr().add(i * I16_CHUNK), t);
-            }
+            vector_add_sub_tiled(
+                input,
+                output,
+                [psqt_block(bucket, add)],
+                [psqt_block(bucket, sub)],
+            );
         }
     }
 
@@ -415,32 +447,13 @@ mod simd {
         sub1: PsqtFeatureIndex,
         sub2: PsqtFeatureIndex,
     ) {
-        let offset_add = add.index() * L1_SIZE;
-        let offset_sub1 = sub1.index() * L1_SIZE;
-        let offset_sub2 = sub2.index() * L1_SIZE;
-        let a_block;
-        let s_block1;
-        let s_block2;
-        // SAFETY: offset_{add,sub}{1,2} are all multiples of LAYER_1_SIZE, and so are correctly-aligned.
-        // additionally, as they originate from FeatureIndex, the L1-SIZE slices are all in bounds, as
-        // FeatureIndex ranges in 0..704.
         unsafe {
-            a_block = slice_to_aligned(bucket.get_unchecked(offset_add..offset_add + L1_SIZE));
-            s_block1 = slice_to_aligned(bucket.get_unchecked(offset_sub1..offset_sub1 + L1_SIZE));
-            s_block2 = slice_to_aligned(bucket.get_unchecked(offset_sub2..offset_sub2 + L1_SIZE));
-        }
-        for i in 0..L1_SIZE / I16_CHUNK {
-            // SAFETY: we never hold multiple mutable references, we never mutate immutable memory, etc.
-            unsafe {
-                let x = simd::load_i16(input.as_ptr().add(i * I16_CHUNK));
-                let w_sub1 = simd::load_i16(s_block1.as_ptr().add(i * I16_CHUNK));
-                let w_sub2 = simd::load_i16(s_block2.as_ptr().add(i * I16_CHUNK));
-                let w_add = simd::load_i16(a_block.as_ptr().add(i * I16_CHUNK));
-                let t = simd::sub_i16(x, w_sub1);
-                let t = simd::sub_i16(t, w_sub2);
-                let t = simd::add_i16(t, w_add);
-                simd::store_i16(output.as_mut_ptr().add(i * I16_CHUNK), t);
-            }
+            vector_add_sub_tiled(
+                input,
+                output,
+                [psqt_block(bucket, add)],
+                [psqt_block(bucket, sub1), psqt_block(bucket, sub2)],
+            );
         }
     }
 
@@ -454,37 +467,13 @@ mod simd {
         sub1: PsqtFeatureIndex,
         sub2: PsqtFeatureIndex,
     ) {
-        let offset_add1 = add1.index() * L1_SIZE;
-        let offset_add2 = add2.index() * L1_SIZE;
-        let offset_sub1 = sub1.index() * L1_SIZE;
-        let offset_sub2 = sub2.index() * L1_SIZE;
-        let a_block1;
-        let a_block2;
-        let s_block1;
-        let s_block2;
-        // SAFETY: offset_{add,sub}{1,2} are all multiples of LAYER_1_SIZE, and so are correctly-aligned.
-        // additionally, as they originate from FeatureIndex, the L1-SIZE slices are all in bounds, as
-        // FeatureIndex ranges in 0..704.
         unsafe {
-            a_block1 = slice_to_aligned(bucket.get_unchecked(offset_add1..offset_add1 + L1_SIZE));
-            a_block2 = slice_to_aligned(bucket.get_unchecked(offset_add2..offset_add2 + L1_SIZE));
-            s_block1 = slice_to_aligned(bucket.get_unchecked(offset_sub1..offset_sub1 + L1_SIZE));
-            s_block2 = slice_to_aligned(bucket.get_unchecked(offset_sub2..offset_sub2 + L1_SIZE));
-        }
-        for i in 0..L1_SIZE / I16_CHUNK {
-            // SAFETY: we never hold multiple mutable references, we never mutate immutable memory, etc.
-            unsafe {
-                let x = simd::load_i16(input.as_ptr().add(i * I16_CHUNK));
-                let w_sub1 = simd::load_i16(s_block1.as_ptr().add(i * I16_CHUNK));
-                let w_sub2 = simd::load_i16(s_block2.as_ptr().add(i * I16_CHUNK));
-                let w_add1 = simd::load_i16(a_block1.as_ptr().add(i * I16_CHUNK));
-                let w_add2 = simd::load_i16(a_block2.as_ptr().add(i * I16_CHUNK));
-                let t = simd::sub_i16(x, w_sub1);
-                let t = simd::sub_i16(t, w_sub2);
-                let t = simd::add_i16(t, w_add1);
-                let t = simd::add_i16(t, w_add2);
-                simd::store_i16(output.as_mut_ptr().add(i * I16_CHUNK), t);
-            }
+            vector_add_sub_tiled(
+                input,
+                output,
+                [psqt_block(bucket, add1), psqt_block(bucket, add2)],
+                [psqt_block(bucket, sub1), psqt_block(bucket, sub2)],
+            );
         }
     }
 }
